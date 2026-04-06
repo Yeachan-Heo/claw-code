@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::ContentBlock;
 use runtime::Session;
+use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -219,6 +220,102 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     assert!(stdout.contains("Status"));
     assert!(stdout.contains("Messages         2"));
     assert!(stdout.contains(newer_path.to_str().expect("utf8 path")));
+}
+
+#[test]
+fn resumed_status_command_emits_structured_json_when_requested() {
+    // given
+    let temp_dir = unique_temp_dir("resume-status-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    let mut session = Session::new();
+    session
+        .push_user_text("resume status json fixture")
+        .expect("session write should succeed");
+    session
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/status",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("resume status output should be json");
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(parsed["model"], "restored-session");
+    assert_eq!(parsed["permission_mode"], "danger-full-access");
+    assert_eq!(parsed["usage"]["messages"], 1);
+    assert!(parsed["usage"]["turns"].is_number());
+    assert!(parsed["workspace"]["cwd"].as_str().is_some());
+    assert_eq!(
+        parsed["workspace"]["session"],
+        session_path.to_str().expect("utf8 path")
+    );
+    assert!(parsed["workspace"]["changed_files"].is_number());
+    assert_eq!(parsed["workspace"]["loaded_config_files"].as_u64(), Some(0));
+    assert!(parsed["sandbox"]["filesystem_mode"].as_str().is_some());
+}
+
+#[test]
+fn resumed_sandbox_command_emits_structured_json_when_requested() {
+    // given
+    let temp_dir = unique_temp_dir("resume-sandbox-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    Session::new()
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/sandbox",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("resume sandbox output should be json");
+    assert_eq!(parsed["kind"], "sandbox");
+    assert!(parsed["enabled"].is_boolean());
+    assert!(parsed["active"].is_boolean());
+    assert!(parsed["supported"].is_boolean());
+    assert!(parsed["filesystem_mode"].as_str().is_some());
+    assert!(parsed["allowed_mounts"].is_array());
+    assert!(parsed["markers"].is_array());
 }
 
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {

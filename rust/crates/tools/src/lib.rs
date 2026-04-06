@@ -11,21 +11,21 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
+    grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
-    TaskPacket,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
-    McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent,
-    RuntimeError, Session, ToolError, ToolExecutor,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1705,7 +1705,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
                 "method": method,
                 "status_code": status,
                 "body": truncated_body,
-                "success": status >= 200 && status < 300
+                "success": (200..300).contains(&status)
             }))
         }
         Err(e) => to_pretty_json(json!({
@@ -1878,27 +1878,25 @@ fn branch_divergence_output(
         dangerously_disable_sandbox: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         no_output_expected: Some(false),
-        structured_content: Some(vec![
-            serde_json::to_value(
-                LaneEvent::new(
-                    LaneEventName::BranchStaleAgainstMain,
-                    LaneEventStatus::Blocked,
-                    iso8601_now(),
-                )
-                    .with_failure_class(LaneFailureClass::BranchDivergence)
-                    .with_detail(stderr.clone())
-                    .with_data(json!({
-                        "branch": branch,
-                        "mainRef": main_ref,
-                        "commitsBehind": commits_behind,
-                        "commitsAhead": commits_ahead,
-                        "missingCommits": missing_fixes,
-                        "blockedCommand": command,
-                        "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
-                    })),
+        structured_content: Some(vec![serde_json::to_value(
+            LaneEvent::new(
+                LaneEventName::BranchStaleAgainstMain,
+                LaneEventStatus::Blocked,
+                iso8601_now(),
             )
-            .expect("lane event should serialize"),
-        ]),
+            .with_failure_class(LaneFailureClass::BranchDivergence)
+            .with_detail(stderr.clone())
+            .with_data(json!({
+                "branch": branch,
+                "mainRef": main_ref,
+                "commitsBehind": commits_behind,
+                "commitsAhead": commits_ahead,
+                "missingCommits": missing_fixes,
+                "blockedCommand": command,
+                "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+            })),
+        )
+        .expect("lane event should serialize")]),
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
@@ -2368,6 +2366,8 @@ struct AgentOutput {
     lane_events: Vec<LaneEvent>,
     #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
     current_blocker: Option<LaneEventBlocker>,
+    #[serde(rename = "derivedState")]
+    derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -2979,15 +2979,21 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     }
 
     let mut candidates = Vec::new();
+    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
+        candidates.push(std::path::PathBuf::from(claw_config_home).join("skills"));
+    }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
     }
     if let Ok(home) = std::env::var("HOME") {
         let home = std::path::PathBuf::from(home);
+        candidates.push(home.join(".claw").join("skills"));
         candidates.push(home.join(".agents").join("skills"));
         candidates.push(home.join(".config").join("opencode").join("skills"));
         candidates.push(home.join(".codex").join("skills"));
+        candidates.push(home.join(".claude").join("skills"));
     }
+    candidates.push(std::path::PathBuf::from("/home/bellman/.claw/skills"));
     candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
 
     for root in candidates {
@@ -3083,6 +3089,7 @@ where
         completed_at: None,
         lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
+        derived_state: String::from("working"),
         error: None,
     };
     write_agent_manifest(&manifest)?;
@@ -3273,9 +3280,11 @@ fn agent_permission_policy() -> PermissionPolicy {
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
+    let mut normalized = manifest.clone();
+    normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
     std::fs::write(
-        &manifest.manifest_file,
-        serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?,
+        &normalized.manifest_file,
+        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -3294,15 +3303,17 @@ fn persist_agent_terminal_state(
     let mut next_manifest = manifest.clone();
     next_manifest.status = status.to_string();
     next_manifest.completed_at = Some(iso8601_now());
-    next_manifest.current_blocker = blocker.clone();
+    next_manifest.current_blocker.clone_from(&blocker);
+    next_manifest.derived_state =
+        derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
     next_manifest.error = error;
     if let Some(blocker) = blocker {
-        next_manifest.lane_events.push(
-            LaneEvent::blocked(iso8601_now(), &blocker),
-        );
-        next_manifest.lane_events.push(
-            LaneEvent::failed(iso8601_now(), &blocker),
-        );
+        next_manifest
+            .lane_events
+            .push(LaneEvent::blocked(iso8601_now(), &blocker));
+        next_manifest
+            .lane_events
+            .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
         let compressed_detail = result
@@ -3311,8 +3322,90 @@ fn persist_agent_terminal_state(
         next_manifest
             .lane_events
             .push(LaneEvent::finished(iso8601_now(), compressed_detail));
+        if let Some(provenance) = maybe_commit_provenance(result) {
+            next_manifest.lane_events.push(LaneEvent::commit_created(
+                iso8601_now(),
+                Some(format!("commit {}", provenance.commit)),
+                provenance,
+            ));
+        }
     }
     write_agent_manifest(&next_manifest)
+}
+
+fn derive_agent_state(
+    status: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+    blocker: Option<&LaneEventBlocker>,
+) -> &'static str {
+    let normalized_status = status.trim().to_ascii_lowercase();
+    let normalized_error = error.unwrap_or_default().to_ascii_lowercase();
+
+    if normalized_status == "running" {
+        return "working";
+    }
+    if normalized_status == "completed" {
+        return if result.is_some_and(|value| !value.trim().is_empty()) {
+            "finished_cleanable"
+        } else {
+            "finished_pending_report"
+        };
+    }
+    if normalized_error.contains("background") {
+        return "blocked_background_job";
+    }
+    if normalized_error.contains("merge conflict") || normalized_error.contains("cherry-pick") {
+        return "blocked_merge_conflict";
+    }
+    if normalized_error.contains("mcp") {
+        return "degraded_mcp";
+    }
+    if normalized_error.contains("transport")
+        || normalized_error.contains("broken pipe")
+        || normalized_error.contains("connection")
+        || normalized_error.contains("interrupted")
+    {
+        return "interrupted_transport";
+    }
+    if blocker.is_some() {
+        return "truly_idle";
+    }
+    "truly_idle"
+}
+
+fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
+    let commit = extract_commit_sha(result?)?;
+    let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
+    let worktree = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    Some(LaneCommitProvenance {
+        commit: commit.clone(),
+        branch,
+        worktree,
+        canonical_commit: Some(commit.clone()),
+        superseded_by: None,
+        lineage: vec![commit],
+    })
+}
+
+fn extract_commit_sha(result: &str) -> Option<String> {
+    result
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|token| token.len() >= 7 && token.len() <= 40)
+        .map(str::to_string)
+}
+
+fn current_git_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
@@ -4950,10 +5043,10 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, SubagentToolExecutor,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5820,6 +5913,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn agent_fake_runner_can_persist_completion_and_failure() {
         let _guard = env_lock()
             .lock()
@@ -5839,7 +5933,7 @@ mod tests {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
-                    Some("Finished successfully"),
+                    Some("Finished successfully in commit abc1234"),
                     None,
                 )
             },
@@ -5862,7 +5956,19 @@ mod tests {
             completed_manifest_json["laneEvents"][1]["event"],
             "lane.finished"
         );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][2]["event"],
+            "lane.commit.created"
+        );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][2]["data"]["commit"],
+            "abc1234"
+        );
         assert!(completed_manifest_json["currentBlocker"].is_null());
+        assert_eq!(
+            completed_manifest_json["derivedState"],
+            "finished_cleanable"
+        );
 
         let failed = execute_agent_with_spawn(
             AgentInput {
@@ -5909,6 +6015,7 @@ mod tests {
             failed_manifest_json["laneEvents"][2]["failureClass"],
             "tool_runtime"
         );
+        assert_eq!(failed_manifest_json["derivedState"], "truly_idle");
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {
@@ -5942,11 +6049,59 @@ mod tests {
             spawn_error_manifest_json["currentBlocker"]["failureClass"],
             "infra"
         );
+        assert_eq!(spawn_error_manifest_json["derivedState"], "truly_idle");
 
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn agent_state_classification_covers_finished_and_specific_blockers() {
+        assert_eq!(derive_agent_state("running", None, None, None), "working");
+        assert_eq!(
+            derive_agent_state("completed", Some("done"), None, None),
+            "finished_cleanable"
+        );
+        assert_eq!(
+            derive_agent_state("completed", None, None, None),
+            "finished_pending_report"
+        );
+        assert_eq!(
+            derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
+            "degraded_mcp"
+        );
+        assert_eq!(
+            derive_agent_state(
+                "failed",
+                None,
+                Some("background terminal still running"),
+                None
+            ),
+            "blocked_background_job"
+        );
+        assert_eq!(
+            derive_agent_state("failed", None, Some("merge conflict while rebasing"), None),
+            "blocked_merge_conflict"
+        );
+        assert_eq!(
+            derive_agent_state(
+                "failed",
+                None,
+                Some("transport interrupted after partial progress"),
+                None
+            ),
+            "interrupted_transport"
+        );
+    }
+
+    #[test]
+    fn commit_provenance_is_extracted_from_agent_results() {
+        let provenance = maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
+            .expect("commit provenance");
+        assert_eq!(provenance.commit, "deadbee");
+        assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
+        assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
+    }
     #[test]
     fn lane_failure_taxonomy_normalizes_common_blockers() {
         let cases = [
@@ -5977,7 +6132,10 @@ mod tests {
                 "gateway routing rejected the request",
                 LaneFailureClass::GatewayRouting,
             ),
-            ("tool failed: denied tool execution from hook", LaneFailureClass::ToolRuntime),
+            (
+                "tool failed: denied tool execution from hook",
+                LaneFailureClass::ToolRuntime,
+            ),
             ("thread creation failed", LaneFailureClass::Infra),
         ];
 
@@ -6000,11 +6158,17 @@ mod tests {
             (LaneEventName::MergeReady, "lane.merge.ready"),
             (LaneEventName::Finished, "lane.finished"),
             (LaneEventName::Failed, "lane.failed"),
-            (LaneEventName::BranchStaleAgainstMain, "branch.stale_against_main"),
+            (
+                LaneEventName::BranchStaleAgainstMain,
+                "branch.stale_against_main",
+            ),
         ];
 
         for (event, expected) in cases {
-            assert_eq!(serde_json::to_value(event).expect("serialize lane event"), json!(expected));
+            assert_eq!(
+                serde_json::to_value(event).expect("serialize lane event"),
+                json!(expected)
+            );
         }
     }
 

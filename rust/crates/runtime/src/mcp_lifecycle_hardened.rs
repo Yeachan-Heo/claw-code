@@ -1,3 +1,4 @@
+#![allow(clippy::unnested_or_patterns, clippy::map_unwrap_or)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -599,7 +600,10 @@ mod tests {
             ));
 
             match result {
-                McpPhaseResult::Failure { phase: failed_phase, error } => {
+                McpPhaseResult::Failure {
+                    phase: failed_phase,
+                    error,
+                } => {
                     assert_eq!(failed_phase, phase);
                     assert_eq!(error.phase, phase);
                     assert_eq!(
