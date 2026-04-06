@@ -729,8 +729,7 @@ fn assert_token_cost_reporting(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert!(
         run.response["estimated_cost"]
             .as_str()
-            .map(|cost| cost.starts_with('$'))
-            .unwrap_or(false),
+            .is_some_and(|cost| cost.starts_with('$')),
         "estimated_cost should be a dollar-prefixed string"
     );
 }
