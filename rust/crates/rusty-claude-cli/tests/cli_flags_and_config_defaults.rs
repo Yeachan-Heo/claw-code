@@ -105,6 +105,31 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
 }
 
 #[test]
+fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
+    let temp_dir = unique_temp_dir("slash-dispatch-omc");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .current_dir(&temp_dir)
+        .arg("/oh-my-claudecode:hud")
+        .output()
+        .expect("claw should launch");
+
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("unknown slash command outside the REPL: /oh-my-claudecode:hud"));
+    assert!(stderr.contains("Claude Code/OMC plugin command"));
+    assert!(stderr.contains("does not yet load plugin slash commands"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
 fn config_command_loads_defaults_from_standard_config_locations() {
     // given
     let temp_dir = unique_temp_dir("config-defaults");
@@ -156,6 +181,79 @@ fn config_command_loads_defaults_from_standard_config_locations() {
             .to_str()
             .expect("utf8 path")
     ));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn doctor_command_runs_as_a_local_shell_entrypoint() {
+    // given
+    let temp_dir = unique_temp_dir("doctor-entrypoint");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    // when
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .arg("doctor")
+        .output()
+        .expect("claw doctor should launch");
+
+    // then
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Doctor"));
+    assert!(stdout.contains("Auth"));
+    assert!(stdout.contains("Config"));
+    assert!(stdout.contains("Workspace"));
+    assert!(stdout.contains("Sandbox"));
+    assert!(!stdout.contains("Thinking"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
+    let temp_dir = unique_temp_dir("subcommand-help");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    let doctor_help = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .args(["doctor", "--help"])
+        .output()
+        .expect("doctor help should launch");
+    let status_help = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .args(["status", "--help"])
+        .output()
+        .expect("status help should launch");
+
+    assert_success(&doctor_help);
+    let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
+    assert!(doctor_stdout.contains("Usage            claw doctor"));
+    assert!(doctor_stdout.contains("local-only health report"));
+    assert!(!doctor_stdout.contains("Thinking"));
+
+    assert_success(&status_help);
+    let status_stdout = String::from_utf8(status_help.stdout).expect("stdout should be utf8");
+    assert!(status_stdout.contains("Usage            claw status"));
+    assert!(status_stdout.contains("local workspace snapshot"));
+    assert!(!status_stdout.contains("Thinking"));
+
+    let doctor_stderr = String::from_utf8(doctor_help.stderr).expect("stderr should be utf8");
+    let status_stderr = String::from_utf8(status_help.stderr).expect("stderr should be utf8");
+    assert!(!doctor_stderr.contains("auth_unavailable"));
+    assert!(!status_stderr.contains("auth_unavailable"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }

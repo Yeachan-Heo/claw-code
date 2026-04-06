@@ -20,12 +20,14 @@ This plan covers a comprehensive analysis of the current terminal user interface
 
 ### Current TUI Components
 
+> Note: The legacy prototype files `app.rs` and `args.rs` were removed on 2026-04-05.
+> References below describe future extraction targets, not current tracked source files.
+
 | Component | File | What It Does Today | Quality |
 |---|---|---|---|
 | **Input** | `input.rs` (269 lines) | `rustyline`-based line editor with slash-command tab completion, Shift+Enter newline, history | ✅ Solid |
 | **Rendering** | `render.rs` (641 lines) | Markdown→terminal rendering (headings, lists, tables, code blocks with syntect highlighting, blockquotes), spinner widget | ✅ Good |
 | **App/REPL loop** | `main.rs` (3,159 lines) | The monolithic `LiveCli` struct: REPL loop, all slash command handlers, streaming output, tool call display, permission prompting, session management | ⚠️ Monolithic |
-| **Alt App** | `app.rs` (398 lines) | An earlier `CliApp` prototype with `ConversationClient`, stream event handling, `TerminalRenderer`, output format support | ⚠️ Appears unused/legacy |
 
 ### Key Dependencies
 
@@ -56,7 +58,7 @@ This plan covers a comprehensive analysis of the current terminal user interface
 8. **Streaming is char-by-char with artificial delay** — `stream_markdown` sleeps 8ms per whitespace-delimited chunk
 9. **No color theme customization** — hardcoded `ColorTheme::default()`
 10. **No resize handling** — no terminal size awareness for wrapping, truncation, or layout
-11. **Dual app structs** — `app.rs` has a separate `CliApp` that duplicates `LiveCli` from `main.rs`
+11. **Historical dual app split** — the repo previously carried a separate `CliApp` prototype alongside `LiveCli`; the prototype is gone, but the monolithic `main.rs` still needs extraction
 12. **No pager for long outputs** — `/status`, `/config`, `/memory` can overflow the viewport
 13. **Tool results not collapsible** — large bash outputs flood the screen
 14. **No thinking/reasoning indicator** — when the model is in "thinking" mode, no visual distinction
@@ -73,8 +75,8 @@ This plan covers a comprehensive analysis of the current terminal user interface
 | Task | Description | Effort |
 |---|---|---|
 | 0.1 | **Extract `LiveCli` into `app.rs`** — Move the entire `LiveCli` struct, its impl, and helpers (`format_*`, `render_*`, session management) out of `main.rs` into focused modules: `app.rs` (core), `format.rs` (report formatting), `session_manager.rs` (session CRUD) | M |
-| 0.2 | **Remove or merge the legacy `CliApp`** — The existing `app.rs` has an unused `CliApp` with its own `ConversationClient`-based rendering. Either delete it or merge its unique features (stream event handler pattern) into the active `LiveCli` | S |
-| 0.3 | **Extract `main.rs` arg parsing** — The current `parse_args()` is a hand-rolled parser that duplicates the clap-based `args.rs`. Consolidate on the hand-rolled parser (it's more feature-complete) and move it to `args.rs`, or adopt clap fully | S |
+| 0.2 | **Keep the legacy `CliApp` removed** — The old `CliApp` prototype has already been deleted; if any unique ideas remain valuable (for example stream event handler patterns), reintroduce them intentionally inside the active `LiveCli` extraction rather than restoring the old file wholesale | S |
+| 0.3 | **Extract `main.rs` arg parsing** — The current `parse_args()` is still a hand-rolled parser in `main.rs`. If parsing is extracted later, do it into a newly-introduced module intentionally rather than reviving the removed prototype `args.rs` by accident | S |
 | 0.4 | **Create a `tui/` module** — Introduce `crates/rusty-claude-cli/src/tui/mod.rs` as the namespace for all new TUI components: `status_bar.rs`, `layout.rs`, `tool_panel.rs`, etc. | S |
 
 ### Phase 1: Status Bar & Live HUD
@@ -214,7 +216,7 @@ crates/rusty-claude-cli/src/
 | Terminal compatibility issues (tmux, SSH, Windows) | Rely on crossterm's abstraction; test in degraded environments |
 | Performance regression with rich rendering | Profile before/after; keep the fast path (raw streaming) always available |
 | Scope creep into Phase 6 | Ship Phases 0–3 as a coherent release before starting Phase 6 |
-| `app.rs` vs `main.rs` confusion | Phase 0.2 explicitly resolves this by removing the legacy `CliApp` |
+| Historical `app.rs` vs `main.rs` confusion | Keep the legacy prototype removed and avoid reintroducing a second app surface accidentally during extraction |
 
 ---
 

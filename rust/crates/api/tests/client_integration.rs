@@ -104,6 +104,41 @@ async fn send_message_posts_json_and_parses_response() {
 }
 
 #[tokio::test]
+async fn send_message_blocks_oversized_requests_before_the_http_call() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", "{}")],
+    )
+    .await;
+
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let error = client
+        .send_message(&MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64_000,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(600_000),
+                }],
+            }],
+            system: Some("Keep the answer short.".to_string()),
+            tools: None,
+            tool_choice: None,
+            stream: false,
+        })
+        .await
+        .expect_err("oversized request should fail local context-window preflight");
+
+    assert!(matches!(error, ApiError::ContextWindowExceeded { .. }));
+    assert!(
+        state.lock().await.is_empty(),
+        "preflight failure should avoid any upstream HTTP request"
+    );
+}
+
+#[tokio::test]
 async fn send_message_applies_request_profile_and_records_telemetry() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

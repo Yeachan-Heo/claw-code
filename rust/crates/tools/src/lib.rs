@@ -11,21 +11,21 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
+    grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
-    TaskPacket,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
-    McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent,
-    RuntimeError, Session, ToolError, ToolExecutor,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1705,7 +1705,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
                 "method": method,
                 "status_code": status,
                 "body": truncated_body,
-                "success": status >= 200 && status < 300
+                "success": (200..300).contains(&status)
             }))
         }
         Err(e) => to_pretty_json(json!({
@@ -1878,27 +1878,25 @@ fn branch_divergence_output(
         dangerously_disable_sandbox: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         no_output_expected: Some(false),
-        structured_content: Some(vec![
-            serde_json::to_value(
-                LaneEvent::new(
-                    LaneEventName::BranchStaleAgainstMain,
-                    LaneEventStatus::Blocked,
-                    iso8601_now(),
-                )
-                    .with_failure_class(LaneFailureClass::BranchDivergence)
-                    .with_detail(stderr.clone())
-                    .with_data(json!({
-                        "branch": branch,
-                        "mainRef": main_ref,
-                        "commitsBehind": commits_behind,
-                        "commitsAhead": commits_ahead,
-                        "missingCommits": missing_fixes,
-                        "blockedCommand": command,
-                        "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
-                    })),
+        structured_content: Some(vec![serde_json::to_value(
+            LaneEvent::new(
+                LaneEventName::BranchStaleAgainstMain,
+                LaneEventStatus::Blocked,
+                iso8601_now(),
             )
-            .expect("lane event should serialize"),
-        ]),
+            .with_failure_class(LaneFailureClass::BranchDivergence)
+            .with_detail(stderr.clone())
+            .with_data(json!({
+                "branch": branch,
+                "mainRef": main_ref,
+                "commitsBehind": commits_behind,
+                "commitsAhead": commits_ahead,
+                "missingCommits": missing_fixes,
+                "blockedCommand": command,
+                "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+            })),
+        )
+        .expect("lane event should serialize")]),
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
@@ -2368,6 +2366,8 @@ struct AgentOutput {
     lane_events: Vec<LaneEvent>,
     #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
     current_blocker: Option<LaneEventBlocker>,
+    #[serde(rename = "derivedState")]
+    derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -2978,42 +2978,251 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
         return Err(String::from("skill must not be empty"));
     }
 
-    let mut candidates = Vec::new();
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
-    }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
-    for root in candidates {
-        let direct = root.join(requested).join("SKILL.md");
-        if direct.exists() {
-            return Ok(direct);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
-                {
-                    return Ok(path);
-                }
-            }
+    for root in skill_lookup_roots() {
+        if let Some(path) = resolve_skill_path_in_root(&root, requested) {
+            return Ok(path);
         }
     }
 
     Err(format!("unknown skill: {requested}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillLookupOrigin {
+    SkillsDir,
+    LegacyCommandsDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillLookupRoot {
+    path: std::path::PathBuf,
+    origin: SkillLookupOrigin,
+}
+
+fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
+    let mut roots = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        push_project_skill_lookup_roots(&mut roots, &cwd);
+    }
+
+    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
+    }
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
+    }
+    if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("skills"),
+            SkillLookupOrigin::SkillsDir,
+        );
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("skills").join("omc-learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("commands"),
+            SkillLookupOrigin::LegacyCommandsDir,
+        );
+    }
+    push_skill_lookup_root(
+        &mut roots,
+        std::path::PathBuf::from("/home/bellman/.claw/skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        &mut roots,
+        std::path::PathBuf::from("/home/bellman/.codex/skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+
+    roots
+}
+
+fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
+    for ancestor in cwd.ancestors() {
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
+    }
+}
+
+fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
+    push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
+    push_skill_lookup_root(
+        roots,
+        home.join(".agents").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
+        home.join(".config").join("opencode").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
+        home.join(".claude").join("skills").join("omc-learned"),
+        SkillLookupOrigin::SkillsDir,
+    );
+}
+
+fn push_prefixed_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, prefix: &std::path::Path) {
+    push_skill_lookup_root(roots, prefix.join("skills"), SkillLookupOrigin::SkillsDir);
+    push_skill_lookup_root(
+        roots,
+        prefix.join("commands"),
+        SkillLookupOrigin::LegacyCommandsDir,
+    );
+}
+
+fn push_skill_lookup_root(
+    roots: &mut Vec<SkillLookupRoot>,
+    path: std::path::PathBuf,
+    origin: SkillLookupOrigin,
+) {
+    if path.is_dir() && !roots.iter().any(|existing| existing.path == path) {
+        roots.push(SkillLookupRoot { path, origin });
+    }
+}
+
+fn resolve_skill_path_in_root(
+    root: &SkillLookupRoot,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    match root.origin {
+        SkillLookupOrigin::SkillsDir => resolve_skill_path_in_skills_dir(&root.path, requested),
+        SkillLookupOrigin::LegacyCommandsDir => {
+            resolve_skill_path_in_legacy_commands_dir(&root.path, requested)
+        }
+    }
+}
+
+fn resolve_skill_path_in_skills_dir(
+    root: &std::path::Path,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    let direct = root.join(requested).join("SKILL.md");
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let skill_path = entry.path().join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(requested)
+            || skill_frontmatter_name_matches(&skill_path, requested)
+        {
+            return Some(skill_path);
+        }
+    }
+
+    None
+}
+
+fn resolve_skill_path_in_legacy_commands_dir(
+    root: &std::path::Path,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    let direct_dir = root.join(requested).join("SKILL.md");
+    if direct_dir.is_file() {
+        return Some(direct_dir);
+    }
+
+    let direct_markdown = root.join(format!("{requested}.md"));
+    if direct_markdown.is_file() {
+        return Some(direct_markdown);
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate_path = if path.is_dir() {
+            let skill_path = path.join("SKILL.md");
+            if !skill_path.is_file() {
+                continue;
+            }
+            skill_path
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+        {
+            path
+        } else {
+            continue;
+        };
+
+        let matches_entry_name = candidate_path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .trim_end_matches(".md")
+                .eq_ignore_ascii_case(requested);
+        if matches_entry_name || skill_frontmatter_name_matches(&candidate_path, requested) {
+            return Some(candidate_path);
+        }
+    }
+
+    None
+}
+
+fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_skill_name(&contents))
+        .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+}
+
+fn parse_skill_name(contents: &str) -> Option<String> {
+    parse_skill_frontmatter_value(contents, "name")
+}
+
+fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
+            let value = value
+                .trim()
+                .trim_matches(|ch| matches!(ch, '"' | '\''))
+                .trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -3083,6 +3292,7 @@ where
         completed_at: None,
         lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
+        derived_state: String::from("working"),
         error: None,
     };
     write_agent_manifest(&manifest)?;
@@ -3273,9 +3483,11 @@ fn agent_permission_policy() -> PermissionPolicy {
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
+    let mut normalized = manifest.clone();
+    normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
     std::fs::write(
-        &manifest.manifest_file,
-        serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?,
+        &normalized.manifest_file,
+        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -3294,15 +3506,17 @@ fn persist_agent_terminal_state(
     let mut next_manifest = manifest.clone();
     next_manifest.status = status.to_string();
     next_manifest.completed_at = Some(iso8601_now());
-    next_manifest.current_blocker = blocker.clone();
+    next_manifest.current_blocker.clone_from(&blocker);
+    next_manifest.derived_state =
+        derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
     next_manifest.error = error;
     if let Some(blocker) = blocker {
-        next_manifest.lane_events.push(
-            LaneEvent::blocked(iso8601_now(), &blocker),
-        );
-        next_manifest.lane_events.push(
-            LaneEvent::failed(iso8601_now(), &blocker),
-        );
+        next_manifest
+            .lane_events
+            .push(LaneEvent::blocked(iso8601_now(), &blocker));
+        next_manifest
+            .lane_events
+            .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
         let compressed_detail = result
@@ -3311,8 +3525,90 @@ fn persist_agent_terminal_state(
         next_manifest
             .lane_events
             .push(LaneEvent::finished(iso8601_now(), compressed_detail));
+        if let Some(provenance) = maybe_commit_provenance(result) {
+            next_manifest.lane_events.push(LaneEvent::commit_created(
+                iso8601_now(),
+                Some(format!("commit {}", provenance.commit)),
+                provenance,
+            ));
+        }
     }
     write_agent_manifest(&next_manifest)
+}
+
+fn derive_agent_state(
+    status: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+    blocker: Option<&LaneEventBlocker>,
+) -> &'static str {
+    let normalized_status = status.trim().to_ascii_lowercase();
+    let normalized_error = error.unwrap_or_default().to_ascii_lowercase();
+
+    if normalized_status == "running" {
+        return "working";
+    }
+    if normalized_status == "completed" {
+        return if result.is_some_and(|value| !value.trim().is_empty()) {
+            "finished_cleanable"
+        } else {
+            "finished_pending_report"
+        };
+    }
+    if normalized_error.contains("background") {
+        return "blocked_background_job";
+    }
+    if normalized_error.contains("merge conflict") || normalized_error.contains("cherry-pick") {
+        return "blocked_merge_conflict";
+    }
+    if normalized_error.contains("mcp") {
+        return "degraded_mcp";
+    }
+    if normalized_error.contains("transport")
+        || normalized_error.contains("broken pipe")
+        || normalized_error.contains("connection")
+        || normalized_error.contains("interrupted")
+    {
+        return "interrupted_transport";
+    }
+    if blocker.is_some() {
+        return "truly_idle";
+    }
+    "truly_idle"
+}
+
+fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
+    let commit = extract_commit_sha(result?)?;
+    let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
+    let worktree = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    Some(LaneCommitProvenance {
+        commit: commit.clone(),
+        branch,
+        worktree,
+        canonical_commit: Some(commit.clone()),
+        superseded_by: None,
+        lineage: vec![commit],
+    })
+}
+
+fn extract_commit_sha(result: &str) -> Option<String> {
+    result
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|token| token.len() >= 7 && token.len() <= 40)
+        .map(str::to_string)
+}
+
+fn current_git_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
@@ -4950,10 +5246,10 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, SubagentToolExecutor,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5705,6 +6001,305 @@ mod tests {
     }
 
     #[test]
+    fn skill_loads_project_local_claude_skill_prompt() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-skills");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let skill_dir = workspace.join(".claude").join("skills").join("trace");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local trace helper\n---\n# trace\n",
+        )
+        .expect("skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("project-local skill should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert_eq!(output["description"], "Project-local trace helper");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_omc_and_agents_skill_prompts() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-omc-skills");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let omc_skill_dir = workspace.join(".omc").join("skills").join("hud");
+        let agents_skill_dir = workspace.join(".agents").join("skills").join("trace");
+        fs::create_dir_all(&omc_skill_dir).expect("omc skill dir should exist");
+        fs::create_dir_all(&agents_skill_dir).expect("agents skill dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            omc_skill_dir.join("SKILL.md"),
+            "---\nname: hud\ndescription: Project-local OMC HUD helper\n---\n# hud\n",
+        )
+        .expect("omc skill file should exist");
+        fs::write(
+            agents_skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local agents compatibility helper\n---\n# trace\n",
+        )
+        .expect("agents skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let omc_result =
+            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
+        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("agents skill should resolve");
+
+        let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
+        let agents_output: serde_json::Value =
+            serde_json::from_str(&agents_result).expect("valid json");
+        assert!(omc_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".omc/skills/hud/SKILL.md"));
+        assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
+        assert!(agents_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert_eq!(
+            agents_output["description"],
+            "Project-local agents compatibility helper"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_learned_skill_from_claude_config_dir() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("claude-config-learned-skill");
+        let home = root.join("home");
+        let claude_config_dir = root.join("claude-config");
+        let learned_skill_dir = claude_config_dir
+            .join("skills")
+            .join("omc-learned")
+            .join("learned");
+        fs::create_dir_all(&learned_skill_dir).expect("learned skill dir should exist");
+        fs::write(
+            learned_skill_dir.join("SKILL.md"),
+            "---\nname: learned\ndescription: Learned OMC skill\n---\n# learned\n",
+        )
+        .expect("learned skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let result = execute_tool("Skill", &json!({ "skill": "learned" }))
+            .expect("learned skill should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert_eq!(output["description"], "Learned OMC skill");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("claude-config-direct-skill");
+        let home = root.join("home");
+        let claude_config_dir = root.join("claude-config");
+        let skill_dir = claude_config_dir.join("skills").join("statusline");
+        let command_dir = claude_config_dir.join("commands");
+        fs::create_dir_all(&skill_dir).expect("direct skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: statusline\ndescription: Claude config skill\n---\n# statusline\n",
+        )
+        .expect("direct skill file should exist");
+        fs::write(
+            command_dir.join("doctor-check.md"),
+            "---\nname: doctor-check\ndescription: Claude config command\n---\n# doctor-check\n",
+        )
+        .expect("direct command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let direct_skill =
+            execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
+        let direct_skill_output: serde_json::Value =
+            serde_json::from_str(&direct_skill).expect("valid skill json");
+        assert!(direct_skill_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/statusline/SKILL.md"));
+        assert_eq!(direct_skill_output["description"], "Claude config skill");
+
+        let legacy_command =
+            execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
+        let legacy_command_output: serde_json::Value =
+            serde_json::from_str(&legacy_command).expect("valid command json");
+        assert!(legacy_command_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("commands/doctor-check.md"));
+        assert_eq!(
+            legacy_command_output["description"],
+            "Claude config command"
+        );
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_legacy_command_markdown() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-legacy-command");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let command_dir = workspace.join(".claude").join("commands");
+        fs::create_dir_all(&command_dir).expect("legacy command dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            command_dir.join("team.md"),
+            "---\nname: team\ndescription: Legacy team workflow\n---\n# team\n",
+        )
+        .expect("legacy command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let result = execute_tool("Skill", &json!({ "skill": "team" }))
+            .expect("legacy command markdown should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/commands/team.md"));
+        assert_eq!(output["description"], "Legacy team workflow");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
     fn tool_search_supports_keyword_and_select_queries() {
         let keyword = execute_tool(
             "ToolSearch",
@@ -5820,6 +6415,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn agent_fake_runner_can_persist_completion_and_failure() {
         let _guard = env_lock()
             .lock()
@@ -5839,7 +6435,7 @@ mod tests {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
-                    Some("Finished successfully"),
+                    Some("Finished successfully in commit abc1234"),
                     None,
                 )
             },
@@ -5862,7 +6458,19 @@ mod tests {
             completed_manifest_json["laneEvents"][1]["event"],
             "lane.finished"
         );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][2]["event"],
+            "lane.commit.created"
+        );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][2]["data"]["commit"],
+            "abc1234"
+        );
         assert!(completed_manifest_json["currentBlocker"].is_null());
+        assert_eq!(
+            completed_manifest_json["derivedState"],
+            "finished_cleanable"
+        );
 
         let failed = execute_agent_with_spawn(
             AgentInput {
@@ -5909,6 +6517,7 @@ mod tests {
             failed_manifest_json["laneEvents"][2]["failureClass"],
             "tool_runtime"
         );
+        assert_eq!(failed_manifest_json["derivedState"], "truly_idle");
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {
@@ -5942,11 +6551,59 @@ mod tests {
             spawn_error_manifest_json["currentBlocker"]["failureClass"],
             "infra"
         );
+        assert_eq!(spawn_error_manifest_json["derivedState"], "truly_idle");
 
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn agent_state_classification_covers_finished_and_specific_blockers() {
+        assert_eq!(derive_agent_state("running", None, None, None), "working");
+        assert_eq!(
+            derive_agent_state("completed", Some("done"), None, None),
+            "finished_cleanable"
+        );
+        assert_eq!(
+            derive_agent_state("completed", None, None, None),
+            "finished_pending_report"
+        );
+        assert_eq!(
+            derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
+            "degraded_mcp"
+        );
+        assert_eq!(
+            derive_agent_state(
+                "failed",
+                None,
+                Some("background terminal still running"),
+                None
+            ),
+            "blocked_background_job"
+        );
+        assert_eq!(
+            derive_agent_state("failed", None, Some("merge conflict while rebasing"), None),
+            "blocked_merge_conflict"
+        );
+        assert_eq!(
+            derive_agent_state(
+                "failed",
+                None,
+                Some("transport interrupted after partial progress"),
+                None
+            ),
+            "interrupted_transport"
+        );
+    }
+
+    #[test]
+    fn commit_provenance_is_extracted_from_agent_results() {
+        let provenance = maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
+            .expect("commit provenance");
+        assert_eq!(provenance.commit, "deadbee");
+        assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
+        assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
+    }
     #[test]
     fn lane_failure_taxonomy_normalizes_common_blockers() {
         let cases = [
@@ -5977,7 +6634,10 @@ mod tests {
                 "gateway routing rejected the request",
                 LaneFailureClass::GatewayRouting,
             ),
-            ("tool failed: denied tool execution from hook", LaneFailureClass::ToolRuntime),
+            (
+                "tool failed: denied tool execution from hook",
+                LaneFailureClass::ToolRuntime,
+            ),
             ("thread creation failed", LaneFailureClass::Infra),
         ];
 
@@ -6000,11 +6660,17 @@ mod tests {
             (LaneEventName::MergeReady, "lane.merge.ready"),
             (LaneEventName::Finished, "lane.finished"),
             (LaneEventName::Failed, "lane.failed"),
-            (LaneEventName::BranchStaleAgainstMain, "branch.stale_against_main"),
+            (
+                LaneEventName::BranchStaleAgainstMain,
+                "branch.stale_against_main",
+            ),
         ];
 
         for (event, expected) in cases {
-            assert_eq!(serde_json::to_value(event).expect("serialize lane event"), json!(expected));
+            assert_eq!(
+                serde_json::to_value(event).expect("serialize lane event"),
+                json!(expected)
+            );
         }
     }
 
