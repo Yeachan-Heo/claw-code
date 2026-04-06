@@ -360,8 +360,10 @@ impl McpServerManagerError {
     }
 
     fn recoverable(&self) -> bool {
-        !matches!(self.lifecycle_phase(), McpLifecyclePhase::InitializeHandshake)
-            && matches!(self, Self::Transport { .. } | Self::Timeout { .. })
+        !matches!(
+            self.lifecycle_phase(),
+            McpLifecyclePhase::InitializeHandshake
+        ) && matches!(self, Self::Transport { .. } | Self::Timeout { .. })
     }
 
     fn discovery_failure(&self, server_name: &str) -> McpDiscoveryFailure {
@@ -417,10 +419,9 @@ impl McpServerManagerError {
                 ("method".to_string(), (*method).to_string()),
                 ("timeout_ms".to_string(), timeout_ms.to_string()),
             ]),
-            Self::UnknownTool { qualified_name } => BTreeMap::from([(
-                "qualified_tool".to_string(),
-                qualified_name.clone(),
-            )]),
+            Self::UnknownTool { qualified_name } => {
+                BTreeMap::from([("qualified_tool".to_string(), qualified_name.clone())])
+            }
             Self::UnknownServer { server_name } => {
                 BTreeMap::from([("server".to_string(), server_name.clone())])
             }
@@ -1425,11 +1426,10 @@ mod tests {
     use crate::mcp_client::McpClientBootstrap;
 
     use super::{
-        spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-        McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
-        McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpServerManager,
-        McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
-        unsupported_server_failed_server,
+        spawn_mcp_stdio_process, unsupported_server_failed_server, JsonRpcId, JsonRpcRequest,
+        JsonRpcResponse, McpInitializeClientInfo, McpInitializeParams, McpInitializeResult,
+        McpInitializeServerInfo, McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
+        McpServerManager, McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
     };
     use crate::McpLifecyclePhase;
 
@@ -2652,8 +2652,37 @@ mod tests {
         });
     }
 
+    fn write_initialize_disconnect_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("initialize-disconnect.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import sys",
+            "header = b''",
+            r"while not header.endswith(b'\r\n\r\n'):",
+            "    chunk = sys.stdin.buffer.read(1)",
+            "    if not chunk:",
+            "        raise SystemExit(1)",
+            "    header += chunk",
+            "length = 0",
+            r"for line in header.decode().split('\r\n'):",
+            r"    if line.lower().startswith('content-length:'):",
+            r"        length = int(line.split(':', 1)[1].strip())",
+            "if length:",
+            "    sys.stdin.buffer.read(length)",
+            "raise SystemExit(0)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
     #[test]
-    #[ignore = "flaky: intermittent timing issues in CI, see ROADMAP P2.15"]
     fn manager_discovery_report_keeps_healthy_servers_when_one_server_fails() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2663,6 +2692,7 @@ mod tests {
             let script_path = write_manager_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let alpha_log = root.join("alpha.log");
+            let broken_script_path = write_initialize_disconnect_script();
             let servers = BTreeMap::from([
                 (
                     "alpha".to_string(),
@@ -2673,8 +2703,8 @@ mod tests {
                     ScopedMcpServerConfig {
                         scope: ConfigSource::Local,
                         config: McpServerConfig::Stdio(McpStdioServerConfig {
-                            command: "python3".to_string(),
-                            args: vec!["-c".to_string(), "import sys; sys.exit(0)".to_string()],
+                            command: broken_script_path.display().to_string(),
+                            args: Vec::new(),
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
                         }),
@@ -2698,7 +2728,10 @@ mod tests {
             );
             assert!(!report.failed_servers[0].recoverable);
             assert_eq!(
-                report.failed_servers[0].context.get("method").map(String::as_str),
+                report.failed_servers[0]
+                    .context
+                    .get("method")
+                    .map(String::as_str),
                 Some("initialize")
             );
             assert!(report.failed_servers[0].error.contains("initialize"));
@@ -2734,6 +2767,7 @@ mod tests {
 
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);
+            cleanup_script(&broken_script_path);
         });
     }
 

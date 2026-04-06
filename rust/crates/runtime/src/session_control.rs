@@ -1,9 +1,9 @@
+#![allow(dead_code)]
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-
 
 use crate::session::{Session, SessionError};
 

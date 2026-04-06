@@ -8,12 +8,28 @@ on:
       - 'omx-issue-*'
     paths:
       - .github/workflows/rust-ci.yml
+      - .github/scripts/check_doc_source_of_truth.py
+      - .github/FUNDING.yml
+      - README.md
+      - USAGE.md
+      - PARITY.md
+      - PHILOSOPHY.md
+      - ROADMAP.md
+      - docs/**
       - rust/**
   pull_request:
     branches:
       - main
     paths:
       - .github/workflows/rust-ci.yml
+      - .github/scripts/check_doc_source_of_truth.py
+      - .github/FUNDING.yml
+      - README.md
+      - USAGE.md
+      - PARITY.md
+      - PHILOSOPHY.md
+      - ROADMAP.md
+      - docs/**
       - rust/**
   workflow_dispatch:
 
@@ -29,6 +45,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  doc-source-of-truth:
+    name: docs source-of-truth
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check docs and metadata for stale branding
+        run: python .github/scripts/check_doc_source_of_truth.py
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -43,8 +73,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  test-rusty-claude-cli:
-    name: cargo test -p rusty-claude-cli
+  test-workspace:
+    name: cargo test --workspace
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,5 +82,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
-      - name: Run crate tests
-        run: cargo test -p rusty-claude-cli
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  clippy-workspace:
+    name: cargo clippy --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Run workspace clippy
+        run: cargo clippy --workspace

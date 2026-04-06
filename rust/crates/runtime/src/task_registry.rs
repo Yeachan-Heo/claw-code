@@ -1,3 +1,4 @@
+#![allow(clippy::must_use_candidate, clippy::unnecessary_map_or)]
 //! In-memory task registry for sub-agent task lifecycle management.
 
 use std::collections::HashMap;
@@ -76,11 +77,7 @@ impl TaskRegistry {
     }
 
     pub fn create(&self, prompt: &str, description: Option<&str>) -> Task {
-        self.create_task(
-            prompt.to_owned(),
-            description.map(str::to_owned),
-            None,
-        )
+        self.create_task(prompt.to_owned(), description.map(str::to_owned), None)
     }
 
     pub fn create_from_packet(
