@@ -1193,7 +1193,7 @@ fn git_tracks_path(cwd: &Path, path: &str) -> bool {
 
 fn git_metadata_path(cwd: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
-        .args(["rev-parse", "--git-path", "."])
+        .args(["rev-parse", "--git-dir"])
         .current_dir(cwd)
         .output()
         .ok()?;
@@ -1214,17 +1214,27 @@ fn git_metadata_path(cwd: &Path) -> Option<PathBuf> {
 
 fn path_is_writable(path: &Path) -> bool {
     let probe_dir = if path.is_dir() {
-        path.to_path_buf()
+        path
     } else {
-        path.parent().unwrap_or(path).to_path_buf()
+        path.parent().unwrap_or(path)
     };
-    let probe = probe_dir.join(format!(".claw-write-probe-{}", now_secs()));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .and_then(|_| std::fs::remove_file(&probe))
-        .is_ok()
+    std::fs::metadata(probe_dir)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .is_some_and(|metadata| metadata_allows_directory_writes(&metadata))
+}
+
+#[cfg(unix)]
+fn metadata_allows_directory_writes(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    mode & 0o222 != 0 && mode & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_allows_directory_writes(metadata: &std::fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
 }
 
 fn detect_trust_prompt(lowered: &str) -> bool {
@@ -1624,6 +1634,56 @@ mod tests {
         assert!(!warnings.iter().any(|warning| {
             warning.kind == WorkerStartupPreflightWarningKind::FileAbsentOnBranch
                 && warning.path.as_deref() == Some("src/lib.rs")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_preflight_warns_when_git_metadata_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        let git_dir = tmp.path().join("external-gitdir");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(git_dir.join("objects")).expect("objects dir");
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("refs dir");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect(".git file");
+
+        let original_permissions = fs::metadata(&git_dir)
+            .expect("gitdir metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o555);
+        fs::set_permissions(&git_dir, read_only_permissions).expect("make gitdir read-only");
+
+        let warnings = startup_preflight_warnings(&worktree, "Audit repository.");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(&worktree.display().to_string(), &[], true);
+        let observed = registry
+            .observe_startup_preflight(&worker.worker_id, "Audit repository.")
+            .expect("preflight should run");
+
+        fs::set_permissions(&git_dir, original_permissions).expect("restore gitdir permissions");
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::GitMetadataNotWritable
+                && warning.path.as_deref() == Some(git_dir.to_string_lossy().as_ref())
+        }));
+        assert!(observed.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                Some(WorkerEventPayload::StartupPreflightWarning {
+                    kind: WorkerStartupPreflightWarningKind::GitMetadataNotWritable,
+                    path: Some(path),
+                    ..
+                }) if path == git_dir.to_string_lossy().as_ref()
+            )
         }));
     }
 
