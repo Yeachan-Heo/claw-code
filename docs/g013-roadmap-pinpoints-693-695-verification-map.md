@@ -19,6 +19,8 @@ covered by the Claw Code 2.0 board.
 - Install command: `git config core.hooksPath .github/hooks`
 - Gate: `cargo build --manifest-path rust/Cargo.toml --workspace --locked`
 - Escape hatch: `SKIP_CLAW_PRE_PUSH_BUILD=1` prints an explicit skip message.
+- Regression test: `tests/test_pre_push_hook_contract.py` locks the skip
+  hatch and `--locked` build command contract.
 - Purpose: mirror the CI build job locally so stale field/variant references are
   caught before push.
 
@@ -41,6 +43,7 @@ python3 scripts/generate_cc2_board.py
 python3 scripts/validate_cc2_board.py --board .omx/cc2/board.json
 python3 .omx/cc2/validate_issue_parity_intake.py .omx/cc2/issue-parity-intake.json
 bash -n .github/hooks/pre-push
+python3 tests/test_pre_push_hook_contract.py -v
 cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 cargo test --manifest-path rust/Cargo.toml -p claw-analog rag_response_ -- --nocapture
 cargo test --manifest-path rust/Cargo.toml -p runtime startup_preflight -- --nocapture
