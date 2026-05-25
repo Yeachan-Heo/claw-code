@@ -1109,25 +1109,33 @@ enum BlockKind {
     },
 }
 
+const KNOWN_RAG_BOOTSTRAP_PHASES: &[&str] =
+    &["1-sqlite-no-db", "1-sqlite-empty", "1-sqlite", "2-qdrant"];
+
+fn unknown_bootstrap_phase_error(received_value: Value, message: &str) -> String {
+    json!({
+        "kind": "unknown_bootstrap_phase",
+        "field": "phase",
+        "received_value": received_value,
+        "allowed_values": KNOWN_RAG_BOOTSTRAP_PHASES,
+        "message": message,
+    })
+    .to_string()
+}
+
 pub(crate) fn format_rag_query_json_for_model(body: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
     let phase = v.get("phase").and_then(|x| x.as_str()).ok_or_else(|| {
-        json!({
-            "kind": "unknown_bootstrap_phase",
-            "field": "phase",
-            "received_value": v.get("phase").cloned().unwrap_or(Value::Null),
-            "message": "RAG response is missing a string phase; refusing to silently render phase as unknown"
-        })
-        .to_string()
+        unknown_bootstrap_phase_error(
+            v.get("phase").cloned().unwrap_or(Value::Null),
+            "RAG response is missing a string phase; refusing to silently render phase as unknown",
+        )
     })?;
-    if phase.trim().is_empty() || phase == "unknown" {
-        return Err(json!({
-            "kind": "unknown_bootstrap_phase",
-            "field": "phase",
-            "received_value": phase,
-            "message": "RAG response phase must be a concrete phase name"
-        })
-        .to_string());
+    if !KNOWN_RAG_BOOTSTRAP_PHASES.contains(&phase) {
+        return Err(unknown_bootstrap_phase_error(
+            Value::String(phase.to_string()),
+            "RAG response phase is not a recognized bootstrap phase",
+        ));
     }
     let hits = v
         .get("hits")
@@ -2586,6 +2594,16 @@ mod tests {
         let err = format_rag_query_json_for_model(r#"{"hits":[],"phase":"unknown"}"#).unwrap_err();
         assert!(err.contains(r#""kind":"unknown_bootstrap_phase""#));
         assert!(err.contains(r#""received_value":"unknown""#));
+        assert!(err.contains(r#""field":"phase""#));
+    }
+
+    #[test]
+    fn rag_response_unrecognized_phase_returns_typed_error() {
+        let err =
+            format_rag_query_json_for_model(r#"{"hits":[],"phase":"3-drifted"}"#).unwrap_err();
+        assert!(err.contains(r#""kind":"unknown_bootstrap_phase""#));
+        assert!(err.contains(r#""received_value":"3-drifted""#));
+        assert!(err.contains(r#""allowed_values""#));
     }
 
     #[test]
