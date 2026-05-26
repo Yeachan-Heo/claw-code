@@ -46,6 +46,17 @@ class RoadmapHelperTests(unittest.TestCase):
         self.assertIn('999', result.stderr)
         self.assertNotIn('1000', result.stdout)
 
+    def test_roadmap_next_id_fails_when_explicit_roadmap_path_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            roadmap = Path(temp_dir) / 'missing-ROADMAP.md'
+
+            result = run_next_id(roadmap)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual('', result.stdout)
+        self.assertIn('ROADMAP not found', result.stderr)
+        self.assertIn(str(roadmap), result.stderr)
+
     def test_roadmap_next_id_fails_closed_when_checker_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             script_dir = Path(temp_dir) / 'scripts'
