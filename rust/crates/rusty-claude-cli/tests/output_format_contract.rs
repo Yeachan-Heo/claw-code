@@ -1457,6 +1457,54 @@ fn diff_json_changed_file_count_deduplication_733() {
 }
 
 #[test]
+fn bare_slash_command_hint_745() {
+    // #747/#745: claw <slash-cmd> --output-format json must return non-null hint.
+    // bare_slash_command_guidance() previously had no \n so split_error_hint returned hint:null.
+    use std::process::Command;
+    let root = unique_temp_dir("bare-slash-hint");
+    fs::create_dir_all(&root).expect("temp dir");
+    let bin = env!("CARGO_BIN_EXE_claw");
+
+    // issue and pr are non-resume-supported; commit is resume-supported.
+    // All must emit non-null hint in their interactive_only error envelope.
+    for cmd in &["issue", "pr", "commit"] {
+        let output = Command::new(bin)
+            .current_dir(&root)
+            .args(["--output-format", "json", cmd])
+            .env("ANTHROPIC_API_KEY", "test")
+            .output()
+            .expect("claw should run");
+        assert!(
+            !output.status.success(),
+            "claw {cmd} outside REPL must exit non-zero"
+        );
+        // Error envelope is on stderr (type:error path) or stdout
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|l| l.starts_with('{'))
+            .collect::<Vec<_>>()
+            .join("");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let raw = if !stderr.is_empty() {
+            stderr
+        } else {
+            stdout.trim().to_string()
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|_| panic!("claw {cmd} must emit JSON; got: {raw}"));
+        assert_eq!(
+            parsed["error_kind"], "interactive_only",
+            "claw {cmd} must have error_kind:interactive_only (#745)"
+        );
+        let hint = parsed["hint"].as_str().unwrap_or("");
+        assert!(
+            !hint.is_empty(),
+            "claw {cmd} --output-format json hint must be non-empty (#745); got null"
+        );
+    }
+}
+
+#[test]
 fn config_unsupported_section_json_hint_741() {
     // #744/#741: claw config <unknown-section> --output-format json must return
     // error_kind:unsupported_config_section with a non-null hint and supported_sections[].
