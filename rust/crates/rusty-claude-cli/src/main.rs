@@ -1949,16 +1949,17 @@ fn parse_system_prompt_args(
     while index < args.len() {
         match args[index].as_str() {
             "--cwd" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --cwd".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "missing_flag_value: missing value for --cwd.\nUsage: --cwd <path>".to_string()
+                })?;
                 cwd = PathBuf::from(value);
                 index += 2;
             }
             "--date" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --date".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "missing_flag_value: missing value for --date.\nUsage: --date <YYYY-MM-DD>"
+                        .to_string()
+                })?;
                 date.clone_from(value);
                 index += 2;
             }
@@ -1991,7 +1992,7 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
             "--session" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --session".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --session.\nUsage: --session <session-id>".to_string())?;
                 session_reference.clone_from(value);
                 index += 2;
             }
