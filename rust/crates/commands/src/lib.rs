@@ -2606,6 +2606,13 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 .into_iter()
                 .filter(|s| s.name.to_lowercase() == name_raw)
                 .collect();
+            // #805: text-mode show must return an error when skill not found (parity with JSON)
+            if matched.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("skill '{name_raw}' not found\nRun `claw skills list` to see available skills."),
+                ));
+            }
             Ok(render_skills_report(&matched))
         }
         Some("install") => Ok(render_skills_usage(Some("install"))),
