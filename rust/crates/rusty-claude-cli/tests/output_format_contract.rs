@@ -3338,11 +3338,12 @@ fn skills_list_flag_shaped_filter_returns_unknown_option_792() {
 }
 
 #[test]
-fn plugins_list_flag_shaped_filter_returns_unknown_option_793() {
+fn plugins_list_flag_shaped_filter_returns_cli_parse_on_stdout_793_817() {
     // #793: `claw plugins list --bogus-flag` silently returned status:"ok" with empty
     // plugins list instead of an error. The list filter branch in print_plugins treated
     // "--bogus-flag" as an id substring filter and found no matches, producing a false-positive.
-    // Fix: added flag-prefix guard; filter tokens starting with "-" now return unknown_option.
+    // #817: in JSON mode, handled local parse errors now return error_kind:"cli_parse"
+    // on stdout with stderr empty.
     let root = unique_temp_dir("plugins-list-flag-793");
     fs::create_dir_all(&root).expect("temp dir");
     std::process::Command::new("git")
@@ -3366,19 +3367,16 @@ fn plugins_list_flag_shaped_filter_returns_unknown_option_793() {
         !output.status.success(),
         "plugins list --unknown-flag must exit non-zero (#793)"
     );
-    // #803: the early flag guard now returns Err before the JSON branch,
-    // so the error envelope goes to stderr via the main error handler.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let j: serde_json::Value = stderr
-        .lines()
-        .find(|l| l.trim_start().starts_with('{'))
-        .and_then(|l| serde_json::from_str(l).ok())
-        .expect("plugins list flag-filter should emit valid JSON on stderr");
+    assert_eq!(output.status.code(), Some(1), "exit code must be 1 (#817)");
+    // #817: handled JSON local parse errors stay on stdout, with stderr empty.
     assert!(
-        j["error_kind"] == "unknown_option" || j["error_kind"] == "cli_parse",
-        "plugins list flag-shaped filter must return typed error, got {:?}",
-        j["error_kind"]
+        output.stderr.is_empty(),
+        "plugins list flag-filter JSON error must keep stderr empty (#817), got: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let j: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("plugins list flag-filter should emit valid JSON on stdout");
+    assert_eq!(j["error_kind"], "cli_parse");
     assert_eq!(j["status"], "error");
     let h = j["hint"]
         .as_str()
@@ -3694,6 +3692,62 @@ fn plugins_extra_args_have_non_null_hint_797() {
     assert!(
         h.contains("plugins") || h.contains("Usage"),
         "hint should reference plugins usage, got: {h:?}"
+    );
+}
+
+#[test]
+fn plugins_list_trailing_dash_json_error_uses_stdout_817() {
+    // ROADMAP #817: JSON inventory/local parse errors are machine-readable on
+    // stdout. `plugins list --` used to route through the top-level error path,
+    // leaving stdout empty and writing the JSON envelope to stderr.
+    let root = unique_temp_dir("plugins-list-dash-817");
+    fs::create_dir_all(&root).expect("temp dir");
+
+    let output = run_claw(
+        &root,
+        &["--output-format", "json", "plugins", "list", "--"],
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "plugins list -- must exit non-zero (#817)"
+    );
+    assert_eq!(output.status.code(), Some(1), "exit code must be 1 (#817)");
+    assert!(
+        output.stderr.is_empty(),
+        "JSON parse error must keep stderr empty (#817), got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let j: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON error (#817)");
+    assert_eq!(j["kind"], "plugin");
+    assert_eq!(j["action"], "list");
+    assert_eq!(j["status"], "error");
+    assert_eq!(j["error_kind"], "cli_parse");
+    assert_eq!(j["unexpected"], "--");
+}
+
+#[test]
+fn plugins_list_trailing_dash_text_error_stays_on_stderr_817() {
+    let root = unique_temp_dir("plugins-list-dash-text-817");
+    fs::create_dir_all(&root).expect("temp dir");
+
+    let output = run_claw(&root, &["plugins", "list", "--"], &[]);
+    assert!(
+        !output.status.success(),
+        "plugins list -- text mode must exit non-zero (#817)"
+    );
+    assert_eq!(output.status.code(), Some(1), "exit code must be 1 (#817)");
+    assert!(
+        output.stdout.is_empty(),
+        "text parse error should not emit stdout (#817), got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[error-kind: cli_parse]"), "{stderr}");
+    assert!(
+        stderr.contains("unknown option for `claw plugins list`: --"),
+        "{stderr}"
     );
 }
 

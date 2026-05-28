@@ -6433,6 +6433,26 @@ impl LiveCli {
         if action.as_deref() == Some("list") {
             if let Some(filter) = target.as_deref() {
                 if filter.starts_with('-') {
+                    if matches!(output_format, CliOutputFormat::Json) {
+                        // ROADMAP #817: this is a handled local inventory parse error.
+                        // Keep it on stdout in JSON mode so `plugins list --` matches the
+                        // sibling JSON inventory/local surfaces instead of falling through
+                        // to the top-level stderr error path.
+                        let obj = json!({
+                            "type": "error",
+                            "kind": "plugin",
+                            "action": "list",
+                            "status": "error",
+                            "error_kind": "cli_parse",
+                            "error": format!("unknown option for `claw plugins list`: {filter}"),
+                            "message": format!("unknown option for `claw plugins list`: {filter}"),
+                            "unexpected": filter,
+                            "hint": "Usage: claw plugins list [<filter>]\nFilters are id substrings, not flags.",
+                            "exit_code": 1,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&obj)?);
+                        std::process::exit(1);
+                    }
                     return Err(format!(
                         "unknown option for `claw plugins list`: {filter}\nUsage: claw plugins list [<filter>]\nFilters are id substrings, not flags."
                     ).into());
@@ -6513,20 +6533,6 @@ impl LiveCli {
                     }
                 } else if is_list_action {
                     if let Some(filter) = target {
-                        // #793: flag-shaped tokens silently became substring filters on
-                        // plugins list, returning empty success instead of an error.
-                        if filter.starts_with('-') {
-                            let obj = json!({
-                                "kind": "plugin",
-                                "action": "list",
-                                "status": "error",
-                                "error_kind": "unknown_option",
-                                "unexpected": filter,
-                                "hint": "Usage: claw plugins list [<filter>]\nFilters are id substrings, not flags.",
-                            });
-                            println!("{}", serde_json::to_string_pretty(&obj)?);
-                            std::process::exit(1);
-                        }
                         let needle = filter.to_lowercase();
                         payload
                             .plugins
