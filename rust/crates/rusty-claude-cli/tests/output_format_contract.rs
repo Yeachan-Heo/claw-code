@@ -72,6 +72,18 @@ fn doctor_help_json_is_local_structured_and_bounded_702() {
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     let parsed = assert_json_command(&root, &["--output-format", "json", "doctor", "--help"]);
+    assert_doctor_help_json_contract(&parsed);
+
+    let suffix_parsed =
+        assert_json_command(&root, &["doctor", "--help", "--output-format", "json"]);
+    assert_doctor_help_json_contract(&suffix_parsed);
+
+    let help_topic_parsed =
+        assert_json_command(&root, &["help", "doctor", "--output-format", "json"]);
+    assert_doctor_help_json_contract(&help_topic_parsed);
+}
+
+fn assert_doctor_help_json_contract(parsed: &Value) {
     assert_eq!(parsed["kind"], "help");
     assert_eq!(parsed["action"], "help");
     assert_eq!(parsed["status"], "ok");
