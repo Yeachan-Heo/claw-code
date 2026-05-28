@@ -1259,6 +1259,66 @@ fn inventory_commands_deduplicate_config_deprecation_warnings_per_process() {
     }
 }
 
+#[test]
+fn config_json_reports_deprecations_structurally_without_stderr_duplicate_815() {
+    let root = unique_temp_dir("config-json-warning-815");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"enabledPlugins": {}}"#,
+    )
+    .expect("deprecated config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+    let output = run_claw(&root, &["--output-format", "json", "config"], &envs);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid json");
+    let warnings = parsed["warnings"]
+        .as_array()
+        .expect("config JSON should include warnings[]");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("field \"enabledPlugins\" is deprecated"))),
+        "config JSON warnings[] should include enabledPlugins deprecation: {parsed}"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        !stderr.contains("field \"enabledPlugins\" is deprecated"),
+        "JSON config should not duplicate collected config deprecations on stderr:\n{stderr}"
+    );
+
+    let text_output = run_claw(&root, &["config"], &envs);
+    assert!(
+        text_output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&text_output.stdout),
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    let text_stderr = String::from_utf8(text_output.stderr).expect("stderr utf8");
+    assert!(
+        text_stderr.contains("field \"enabledPlugins\" is deprecated"),
+        "text config should keep human-readable config warnings on stderr"
+    );
+}
+
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
 }

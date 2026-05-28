@@ -379,12 +379,6 @@ impl ConfigLoader {
             loaded_entries.push(entry);
         }
 
-        // Still emit to stderr for non-JSON callers that go through the normal load() path;
-        // here we just *also* return them so callers can surface them structurally.
-        for warning in &all_warnings {
-            emit_config_warning_once(warning);
-        }
-
         let merged_value = JsonValue::Object(merged.clone());
 
         let feature_config = RuntimeFeatureConfig {

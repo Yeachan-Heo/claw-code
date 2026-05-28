@@ -1157,7 +1157,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return action;
     }
 
-    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+    // Keep config-backed defaults lazy so pure-local JSON surfaces (notably
+    // `claw --output-format json config`) can report config warnings
+    // structurally without an earlier default-resolution load writing prose
+    // warnings to stderr.
+    let permission_mode = || permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
@@ -1301,7 +1305,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     model,
                     output_format,
                     allowed_tools,
-                    permission_mode,
+                    permission_mode: permission_mode(),
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
@@ -1338,7 +1342,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model,
                 output_format,
                 allowed_tools,
-                permission_mode,
+                permission_mode: permission_mode(),
                 compact,
                 base_commit: base_commit.clone(),
                 reasoning_effort: reasoning_effort.clone(),
@@ -1350,7 +1354,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             output_format,
             allowed_tools,
-            permission_mode,
+            permission_mode(),
             compact,
             base_commit,
             reasoning_effort,
@@ -1389,7 +1393,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model,
                 output_format,
                 allowed_tools,
-                permission_mode,
+                permission_mode: permission_mode(),
                 compact,
                 base_commit,
                 reasoning_effort: reasoning_effort.clone(),
