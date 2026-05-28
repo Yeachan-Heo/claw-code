@@ -1319,6 +1319,102 @@ fn config_json_reports_deprecations_structurally_without_stderr_duplicate_815() 
     );
 }
 
+#[test]
+fn local_json_surfaces_suppress_config_deprecation_stderr_816() {
+    let root = unique_temp_dir("global-json-warning-816");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"enabledPlugins": {}}"#,
+    )
+    .expect("deprecated config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+
+    for (args, expected_kind, expected_action) in [
+        (
+            &["--output-format", "json", "plugins", "list"][..],
+            "plugin",
+            "list",
+        ),
+        (
+            &["--output-format", "json", "mcp", "list"][..],
+            "mcp",
+            "list",
+        ),
+        (
+            &["--output-format", "json", "doctor"][..],
+            "doctor",
+            "doctor",
+        ),
+    ] {
+        let output = run_claw(&root, args, &envs);
+        assert!(
+            output.status.success(),
+            "args={args:?}\nstdout:\n{}\n\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: Value =
+            serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+        assert_eq!(parsed["kind"], expected_kind, "args={args:?}");
+        assert_eq!(parsed["action"], expected_action, "args={args:?}");
+        assert!(
+            matches!(parsed["status"].as_str(), Some("ok" | "warn")),
+            "args={args:?} should report successful local status: {parsed}"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+        assert!(
+            !stderr.contains("field \"enabledPlugins\" is deprecated"),
+            "successful JSON surface must not leak config deprecation prose to stderr for args={args:?}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn local_text_surface_preserves_config_deprecation_stderr_816() {
+    let root = unique_temp_dir("global-text-warning-816");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"enabledPlugins": {}}"#,
+    )
+    .expect("deprecated config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+
+    let output = run_claw(&root, &["doctor"], &envs);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("field \"enabledPlugins\" is deprecated"),
+        "text-mode doctor should preserve human config deprecation warnings on stderr"
+    );
+}
+
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
 }

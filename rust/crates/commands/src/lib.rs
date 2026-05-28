@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    RuntimeConfig, ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
 
@@ -2542,6 +2542,14 @@ pub fn handle_mcp_slash_command_json(
     render_mcp_report_json_for(&loader, cwd, args)
 }
 
+fn load_runtime_config_without_stderr_warnings(
+    loader: &ConfigLoader,
+) -> Result<RuntimeConfig, runtime::ConfigError> {
+    loader
+        .load_collecting_warnings()
+        .map(|(runtime_config, _warnings)| runtime_config)
+}
+
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {
@@ -2994,7 +3002,7 @@ fn render_mcp_report_json_for(
             // failure, emit top-level `status: "degraded"` with
             // `config_load_error`, empty servers[], and exit 0. On clean
             // runs, the existing serializer adds `status: "ok"` below.
-            match loader.load() {
+            match load_runtime_config_without_stderr_warnings(loader) {
                 Ok(runtime_config) => {
                     let mut value =
                         render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
@@ -3030,7 +3038,7 @@ fn render_mcp_report_json_for(
                 return Ok(render_mcp_usage_json(Some(args)));
             }
             // #144: same degradation pattern for show action.
-            match loader.load() {
+            match load_runtime_config_without_stderr_warnings(loader) {
                 Ok(runtime_config) => {
                     let mut value = render_mcp_server_report_json(
                         cwd,

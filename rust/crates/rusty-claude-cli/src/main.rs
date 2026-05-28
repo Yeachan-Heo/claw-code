@@ -2414,6 +2414,24 @@ impl DiagnosticCheck {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ConfigWarningMode {
+    EmitStderr,
+    SuppressStderr,
+}
+
+fn load_config_with_warning_mode(
+    loader: &ConfigLoader,
+    mode: ConfigWarningMode,
+) -> Result<runtime::RuntimeConfig, runtime::ConfigError> {
+    match mode {
+        ConfigWarningMode::EmitStderr => loader.load(),
+        ConfigWarningMode::SuppressStderr => loader
+            .load_collecting_warnings()
+            .map(|(runtime_config, _warnings)| runtime_config),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoctorReport {
     checks: Vec<DiagnosticCheck>,
@@ -2503,10 +2521,12 @@ fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
     lines.join("\n")
 }
 
-fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
+fn render_doctor_report(
+    config_warning_mode: ConfigWarningMode,
+) -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let config_loader = ConfigLoader::default_for(&cwd);
-    let config = config_loader.load();
+    let config = load_config_with_warning_mode(&config_loader, config_warning_mode);
     let discovered_config = config_loader.discover();
     let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
@@ -2559,7 +2579,10 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
 }
 
 fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let report = render_doctor_report()?;
+    let report = render_doctor_report(match output_format {
+        CliOutputFormat::Json => ConfigWarningMode::SuppressStderr,
+        CliOutputFormat::Text => ConfigWarningMode::EmitStderr,
+    })?;
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -4641,7 +4664,12 @@ fn run_resume_command(
                 _ => {}
             }
             let cwd = env::current_dir()?;
-            let payload = plugins_command_payload_for(&cwd, action.as_deref(), target.as_deref())?;
+            let payload = plugins_command_payload_for(
+                &cwd,
+                action.as_deref(),
+                target.as_deref(),
+                ConfigWarningMode::EmitStderr,
+            )?;
             let action_str = action.as_deref().unwrap_or("list");
             let enabled_count = payload
                 .plugins
@@ -4675,7 +4703,7 @@ fn run_resume_command(
             })
         }
         SlashCommand::Doctor => {
-            let report = render_doctor_report()?;
+            let report = render_doctor_report(ConfigWarningMode::EmitStderr)?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(report.render()),
@@ -5981,7 +6009,10 @@ impl LiveCli {
                 false
             }
             SlashCommand::Doctor => {
-                println!("{}", render_doctor_report()?.render());
+                println!(
+                    "{}",
+                    render_doctor_report(ConfigWarningMode::EmitStderr)?.render()
+                );
                 false
             }
             SlashCommand::History { count } => {
@@ -6408,7 +6439,15 @@ impl LiveCli {
                 }
             }
         }
-        let payload = plugins_command_payload_for(&cwd, action, target)?;
+        let payload = plugins_command_payload_for(
+            &cwd,
+            action,
+            target,
+            match output_format {
+                CliOutputFormat::Json => ConfigWarningMode::SuppressStderr,
+                CliOutputFormat::Text => ConfigWarningMode::EmitStderr,
+            },
+        )?;
         match output_format {
             CliOutputFormat::Text => {
                 // #806: text-mode show must return error when plugin not found (parity with JSON)
@@ -6735,7 +6774,8 @@ impl LiveCli {
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let payload = plugins_command_payload_for(&cwd, action, target)?;
+        let payload =
+            plugins_command_payload_for(&cwd, action, target, ConfigWarningMode::EmitStderr)?;
         println!("{}", payload.message);
         if payload.reload_runtime {
             self.reload_runtime_features()?;
@@ -9133,9 +9173,11 @@ fn plugins_command_payload_for(
     cwd: &Path,
     action: Option<&str>,
     target: Option<&str>,
+    config_warning_mode: ConfigWarningMode,
 ) -> Result<PluginsCommandPayload, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(cwd);
-    let (runtime_config, config_load_error) = match loader.load() {
+    let loaded_config = load_config_with_warning_mode(&loader, config_warning_mode);
+    let (runtime_config, config_load_error) = match loaded_config {
         Ok(runtime_config) => (runtime_config, None),
         Err(error) => (runtime::RuntimeConfig::empty(), Some(error.to_string())),
     };
@@ -12804,8 +12846,13 @@ mod tests {
 
         let previous_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        let payload = super::plugins_command_payload_for(&cwd, None, None)
-            .expect("plugins list should not hard-fail on malformed MCP config");
+        let payload = super::plugins_command_payload_for(
+            &cwd,
+            None,
+            None,
+            super::ConfigWarningMode::EmitStderr,
+        )
+        .expect("plugins list should not hard-fail on malformed MCP config");
         match previous_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
