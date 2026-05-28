@@ -7885,9 +7885,50 @@ fn render_export_help_json() -> serde_json::Value {
     })
 }
 
+fn render_doctor_help_json() -> serde_json::Value {
+    json!({
+        "kind": "help",
+        "action": "help",
+        "status": "ok",
+        "topic": "doctor",
+        "command": "doctor",
+        "schema_version": "1.0",
+        "usage": "claw doctor [--output-format <format>]",
+        "purpose": "diagnose local auth, config, workspace, sandbox, boot preflight, and build metadata",
+        "formats": ["text", "json"],
+        "local_only": true,
+        "requires_credentials": false,
+        "requires_provider_request": false,
+        "requires_session_resume": false,
+        "mutates_workspace": false,
+        "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks"],
+        "check_names": ["auth", "config", "install source", "workspace", "boot preflight", "sandbox", "system"],
+        "status_values": ["ok", "warn", "fail"],
+        "options": [
+            {
+                "name": "--output-format",
+                "value": "<format>",
+                "values": ["text", "json"],
+                "default": "text",
+                "description": "format for the doctor report or help envelope"
+            },
+            {
+                "name": "--help",
+                "aliases": ["-h"],
+                "description": "show help for the doctor command without running diagnostics"
+            }
+        ],
+        "related": ["/doctor", "claw --resume latest /doctor"],
+        "message": render_help_topic(LocalHelpTopic::Doctor),
+    })
+}
+
 fn render_help_topic_json(topic: LocalHelpTopic) -> serde_json::Value {
     if topic == LocalHelpTopic::Export {
         return render_export_help_json();
+    }
+    if topic == LocalHelpTopic::Doctor {
+        return render_doctor_help_json();
     }
 
     json!({

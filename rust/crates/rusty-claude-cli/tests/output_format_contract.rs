@@ -67,6 +67,52 @@ fn export_help_preserves_plaintext_in_text_mode_384() {
 }
 
 #[test]
+fn doctor_help_json_is_local_structured_and_bounded_702() {
+    let root = unique_temp_dir("doctor-help-json-702");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let parsed = assert_json_command(&root, &["--output-format", "json", "doctor", "--help"]);
+    assert_eq!(parsed["kind"], "help");
+    assert_eq!(parsed["action"], "help");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["topic"], "doctor");
+    assert_eq!(parsed["command"], "doctor");
+    assert_eq!(parsed["usage"], "claw doctor [--output-format <format>]");
+    assert_eq!(parsed["local_only"], true);
+    assert_eq!(parsed["requires_credentials"], false);
+    assert_eq!(parsed["requires_provider_request"], false);
+    assert_eq!(parsed["requires_session_resume"], false);
+    assert_eq!(parsed["mutates_workspace"], false);
+
+    let fields = parsed["output_fields"].as_array().expect("output_fields");
+    assert!(fields.iter().any(|field| field == "checks"));
+    let statuses = parsed["status_values"].as_array().expect("status_values");
+    assert!(statuses.iter().any(|status| status == "warn"));
+    let checks = parsed["check_names"].as_array().expect("check_names");
+    assert!(checks.iter().any(|check| check == "auth"));
+    assert!(checks.iter().any(|check| check == "boot preflight"));
+}
+
+#[test]
+fn doctor_help_text_stays_plaintext_and_local_702() {
+    let root = unique_temp_dir("doctor-help-text-702");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let output = run_claw(&root, &["doctor", "--help"], &[]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.starts_with("Doctor\n"));
+    assert!(stdout.contains("Usage            claw doctor"));
+    assert!(stdout.contains("no provider request or session resume required"));
+    serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
+}
+
+#[test]
 fn version_emits_json_when_requested() {
     let root = unique_temp_dir("version-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
