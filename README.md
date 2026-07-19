@@ -11,7 +11,7 @@
   ·
   <a href="./ROADMAP.md">Roadmap</a>
   ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
+  <a href="https://discord.gg/jq6jnSGABY">UltraWorkers Discord</a>
 </p>
 
 <p align="center">
@@ -123,7 +123,7 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 - [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+- [UltraWorkers Discord](https://discord.gg/jq6jnSGABY)
 
 ## Ownership / affiliation disclaimer
 
